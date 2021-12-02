@@ -33,6 +33,7 @@ import (
 	"github.com/containerd/cgroups/v2/stats"
 
 	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
+	"github.com/fsnotify/fsnotify"
 	"github.com/godbus/dbus/v5"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
@@ -560,49 +561,39 @@ func (c *Manager) freeze(path string, state State) error {
 	}
 }
 
-// MemoryEventFD returns inotify file descriptor and 'memory.events' inotify watch descriptor
-func (c *Manager) MemoryEventFD() (int, uint32, error) {
-	fpath := filepath.Join(c.path, "memory.events")
-	fd, err := syscall.InotifyInit()
-	if err != nil {
-		return 0, 0, errors.New("failed to create inotify fd")
-	}
-	wd, err := syscall.InotifyAddWatch(fd, fpath, unix.IN_MODIFY)
-	if wd < 0 {
-		syscall.Close(fd)
-		return 0, 0, fmt.Errorf("failed to add inotify watch for %q", fpath)
-	}
-
-	return fd, uint32(wd), nil
-}
-
-func (c *Manager) EventChan() (<-chan Event, <-chan error) {
+func (c *Manager) EventChan() (<-chan Event, <-chan error, chan<- error) {
 	ec := make(chan Event)
 	errCh := make(chan error)
-	go c.waitForEvents(ec, errCh)
+	quitCh := make(chan error)
+	go c.waitForEvents(ec, errCh, quitCh)
 
-	return ec, nil
+	return ec, errCh, quitCh
 }
 
-func (c *Manager) waitForEvents(ec chan<- Event, errCh chan<- error) {
-	fd, wd, err := c.MemoryEventFD()
-
-	defer syscall.InotifyRmWatch(fd, wd)
-	defer syscall.Close(fd)
-
+func (c *Manager) waitForEvents(ec chan<- Event, errCh chan<- error, quitCh <-chan error) {
+	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		errCh <- err
 		return
 	}
-
+	defer watcher.Close()
+	fpath := filepath.Join(c.path, "memory.events")
+	err = watcher.Add(fpath)
+	if err != nil {
+		errCh <- err
+		return
+	}
 	for {
-		buffer := make([]byte, syscall.SizeofInotifyEvent*10)
-		bytesRead, err := syscall.Read(fd, buffer)
-		if err != nil {
+		select {
+		case <-quitCh:
+			return
+		case err := <-watcher.Errors:
 			errCh <- err
 			return
-		}
-		if bytesRead >= syscall.SizeofInotifyEvent {
+		case evt := <-watcher.Events:
+			if evt.Op != fsnotify.Write {
+				continue
+			}
 			out := make(map[string]interface{})
 			if err := readKVStatsFile(c.path, "memory.events", out); err == nil {
 				e := Event{}
