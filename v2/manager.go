@@ -560,6 +560,23 @@ func (c *Manager) freeze(path string, state State) error {
 	}
 }
 
+func (c *Manager) isCgroupEmpty() bool {
+	// In case of any error we return true so that we exit and don't leak resources
+	out := make(map[string]interface{})
+	err := readKVStatsFile(c.path, "cgroup.events", out)
+	if err != nil {
+		return true
+	}
+	if v, ok := out["populated"]; ok {
+		populated, ok := v.(uint64)
+		if !ok {
+			return true
+		}
+		return populated == 0
+	}
+	return true
+}
+
 // MemoryEventFD returns inotify file descriptor and 'memory.events' inotify watch descriptor
 func (c *Manager) MemoryEventFD() (int, uint32, error) {
 	fpath := filepath.Join(c.path, "memory.events")
@@ -572,6 +589,13 @@ func (c *Manager) MemoryEventFD() (int, uint32, error) {
 		syscall.Close(fd)
 		return 0, 0, fmt.Errorf("failed to add inotify watch for %q", fpath)
 	}
+	// monitor to detect process exit/cgroup deletion
+	evpath := filepath.Join(c.path, "cgroup.events")
+	wd_cg, err := syscall.InotifyAddWatch(fd, evpath, unix.IN_MODIFY)
+	if wd_cg < 0 {
+		syscall.Close(fd)
+		return 0, 0, fmt.Errorf("failed to add inotify watch for %q", evpath)
+	}
 
 	return fd, uint32(wd), nil
 }
@@ -581,13 +605,12 @@ func (c *Manager) EventChan() (<-chan Event, <-chan error) {
 	errCh := make(chan error)
 	go c.waitForEvents(ec, errCh)
 
-	return ec, nil
+	return ec, errCh
 }
 
 func (c *Manager) waitForEvents(ec chan<- Event, errCh chan<- error) {
-	fd, wd, err := c.MemoryEventFD()
+	fd, _, err := c.MemoryEventFD()
 
-	defer syscall.InotifyRmWatch(fd, wd)
 	defer syscall.Close(fd)
 
 	if err != nil {
@@ -643,7 +666,17 @@ func (c *Manager) waitForEvents(ec chan<- Event, errCh chan<- error) {
 				}
 				ec <- e
 			} else {
-				errCh <- err
+				// When cgroup is deleted read may return -ENODEV instead of -ENOENT from open
+				_, statErr := os.Lstat(filepath.Join(c.path, "memory.events"))
+				if os.IsNotExist(statErr) {
+					close(errCh)
+				} else {
+					errCh <- err
+				}
+				return
+			}
+			if c.isCgroupEmpty() {
+				close(errCh)
 				return
 			}
 		}
