@@ -570,24 +570,7 @@ func (c *Manager) EventChan() (<-chan Event, <-chan error, chan<- error) {
 	return ec, errCh, quitCh
 }
 
-func isCgroupEmpty(path string) (bool, error) {
-	out := make(map[string]interface{})
-	if err := readKVStatsFile(path, "cgroup.events", out); err != nil {
-		// this may fail if cgroup is removed, exit quietly
-		return true, nil
-	}
-	if v, ok := out["populated"]; ok {
-		populated, ok := v.(uint64)
-		if !ok {
-			return false, fmt.Errorf("cannot convert populated to uint64: %+v", v)
-		}
-		return populated == 0, nil
-	}
-	return false, fmt.Errorf("cannot parse 'populated' field")
-}
-
 func (c *Manager) waitForEvents(ec chan<- Event, errCh chan<- error, quitCh <-chan error) {
-	defer close(errCh)
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		errCh <- err
@@ -596,12 +579,6 @@ func (c *Manager) waitForEvents(ec chan<- Event, errCh chan<- error, quitCh <-ch
 	defer watcher.Close()
 	fpath := filepath.Join(c.path, "memory.events")
 	err = watcher.Add(fpath)
-	if err != nil {
-		errCh <- err
-		return
-	}
-	evpath := filepath.Join(c.path, "cgroup.events")
-	err = watcher.Add(evpath)
 	if err != nil {
 		errCh <- err
 		return
@@ -616,18 +593,6 @@ func (c *Manager) waitForEvents(ec chan<- Event, errCh chan<- error, quitCh <-ch
 		case evt := <-watcher.Events:
 			if evt.Op != fsnotify.Write {
 				continue
-			}
-			if evt.Name == evpath {
-				cgroupEmpty, err := isCgroupEmpty(c.path)
-				if err != nil {
-					errCh <- err
-					return
-				}
-				if cgroupEmpty {
-					return
-				} else {
-					continue
-				}
 			}
 			out := make(map[string]interface{})
 			if err := readKVStatsFile(c.path, "memory.events", out); err == nil {
