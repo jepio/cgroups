@@ -15,7 +15,7 @@ Vagrant.configure("2") do |config|
   config.vm.provision "shell", inline: <<-SHELL
     set -eux -o pipefail
     # configuration
-    GO_VERSION="1.15"
+    GO_VERSION="1.16"
 
     # install gcc and Golang
     dnf -y install gcc
